@@ -93,7 +93,7 @@ PROVIDER_EXECUTABLE_CANDIDATES = {
     executable: tuple(
         f"{directory}/{executable}" for directory in PROVIDER_EXECUTABLE_DIRS
     )
-    for executable in ("gh", "glab")
+    for executable in ("gh", "glab", "az")
 }
 
 # Generic operator override for the gh binary, honored by every caller after

@@ -190,6 +190,151 @@ def test_local_certificate_discovery_stays_disabled() -> None:
     assert env["CSC_IDENTITY_AUTO_DISCOVERY"] == "false"
 
 
+def _publish_job() -> dict:
+    return _workflow("publish-windows.yml")["jobs"]["publish-windows"]
+
+
+def _publish_step(name_fragment: str) -> dict:
+    for step in _publish_job()["steps"]:
+        if name_fragment in step.get("name", ""):
+            return step
+    raise AssertionError(f"publish-windows.yml has no step named like {name_fragment!r}")
+
+
+def test_the_publish_lane_expects_the_publisher_the_client_verifies() -> None:
+    # NsisUpdater verifies the downloaded installer's Authenticode publisher
+    # fail-closed against electron-builder's publisherName. If the publish lane
+    # accepts a different CN than the client demands, the lane happily publishes
+    # bytes that every client then refuses, and the mutable latest.yml means it
+    # refuses them all at once. One value, asserted from both ends.
+    #
+    # The location is part of the contract, not a detail. electron-builder 26's
+    # WindowsConfiguration is `additionalProperties: false` and carries no
+    # publisherName -- it belongs to WindowsSigntoolConfiguration, i.e. inside
+    # signtoolOptions beside `sign`. A win-level key is not merely ignored: the
+    # schema validator rejects the whole config, so EVERY desktop build fails on
+    # EVERY platform, mac and Linux included. Only this path is read by
+    # WindowsSignToolManager.computedPublisherName, which is what
+    # PublishManager copies into app-update.yml, which is the only thing
+    # NsisUpdater.verifySignature consults -- and an absent value there makes it
+    # return early and skip verification instead of failing, so a misplaced key
+    # silently costs the fail-closed check rather than announcing itself.
+    expected = _publish_job()["env"]["EXPECT_SUBJECT_CN"]
+    config = json.loads(ELECTRON_PACKAGE_JSON.read_text(encoding="utf-8"))
+    win = config["build"]["win"]
+    assert "publisherName" not in win, (
+        "publisherName must live in win.signtoolOptions, not win: electron-builder's "
+        "WindowsConfiguration forbids unknown keys and fails every desktop build."
+    )
+    publisher_name = win["signtoolOptions"]["publisherName"]
+    assert publisher_name == [expected], (
+        f"publish-windows.yml verifies publisher {expected!r} but the client pins "
+        f"{publisher_name!r}; the lane would publish installers the updater rejects."
+    )
+    # verifyUpdateCodeSignature defaults to on (isForceCodeSigningVerification is
+    # `!== false`); setting it false would drop publisherName from app-update.yml
+    # and disable the check the publish guard is paired with.
+    assert win.get("verifyUpdateCodeSignature") is not False
+
+
+def test_the_published_basename_matches_the_clients_manual_download_url() -> None:
+    # manualDownloadUrl() is the escape hatch a user follows when an in-app
+    # update fails, so a basename drift turns the one recovery path into a 404.
+    basename = _publish_job()["env"]["PUBLISHED_BASENAME"]
+    auto_update = (ROOT / "website" / "electron" / "auto-update.js").read_text(
+        encoding="utf-8"
+    )
+    assert f'"{basename}.exe"' in auto_update, (
+        f"publish-windows.yml publishes {basename}.exe but auto-update.js does not "
+        "build that filename; the manual download link would 404."
+    )
+
+
+def test_windows_has_exactly_one_channel_file() -> None:
+    # electron-updater's Provider.getChannelFilePrefix() appends an arch suffix
+    # for linux only and returns "" for win32, so NsisUpdater requests bare
+    # `latest.yml` for EVERY arch. A `latest-<arch>.yml` would be written and
+    # never read, and the arm64 client would silently fetch the x64 feed. A
+    # second Windows arch therefore means a second entry inside this same file.
+    resolve = _publish_step("Resolve arch-dependent names")["run"]
+    assert "FEED_FILE=latest.yml" in resolve
+    assert "latest-arm64.yml" not in resolve, (
+        "a per-arch Windows feed file is never requested by any client"
+    )
+    assert "x64)" in resolve and "exit 1" in resolve, (
+        "an unsupported arch must abort rather than default to the x64 names"
+    )
+
+
+def test_the_updater_offers_exactly_the_channels_that_publish_windows() -> None:
+    # A Windows client resolving a channel with no lane fetches a feed that was
+    # never written: every check 404s and the manual-download link is dead. The
+    # client's channel set and the set of callers that actually invoke the lane
+    # have to move together, in both directions.
+    auto_update = (ROOT / "website" / "electron" / "auto-update.js").read_text(
+        encoding="utf-8"
+    )
+    match = re.search(r"WINDOWS_CHANNELS = new Set\(\[([^\]]*)\]\)", auto_update)
+    assert match, "auto-update.js no longer declares WINDOWS_CHANNELS"
+    client_channels = set(re.findall(r'"([^"]+)"', match.group(1)))
+
+    nightly = next(
+        job
+        for job in _workflow("nightly.yml")["jobs"].values()
+        if str(job.get("uses", "")).endswith("publish-windows.yml")
+    )
+    assert nightly["with"]["channel"] == "nightly"
+
+    release = next(
+        job
+        for job in _workflow("release.yml")["jobs"].values()
+        if str(job.get("uses", "")).endswith("publish-windows.yml")
+    )
+    # Insider only: stable republishes the promotion bundle, which has no Windows
+    # artifact role (see the job's own comment for why that is deliberate).
+    assert "channel == 'insider'" in release["if"]
+    assert "stable" not in release["if"].replace("stable-gate", "")
+
+    assert client_channels == {"nightly", "insider"}, (
+        f"the client offers Windows updates on {sorted(client_channels)} but the "
+        "workflows publish nightly and insider only"
+    )
+
+
+def test_the_signature_is_verified_before_the_bytes_become_immutable() -> None:
+    # The versioned key is written with --if-none-match, so an unsigned or
+    # wrongly-signed installer that reaches S3 burns that version string. The
+    # guard is only a guard if it runs first.
+    names = [step.get("name", "") for step in _publish_job()["steps"]]
+    verify = next(i for i, name in enumerate(names) if "Authenticode" in name)
+    publish = next(i for i, name in enumerate(names) if "Publish installer" in name)
+    attest = next(i for i, name in enumerate(names) if "Attest installer" in name)
+    assert verify < attest < publish, (
+        f"expected verify({verify}) < attest({attest}) < publish({publish}); an "
+        "un-verified or un-attested installer must never reach an immutable key."
+    )
+
+
+def test_publishing_callers_consume_the_artifact_the_build_uploads() -> None:
+    # A typo here is silent: publish-windows.yml probes for the artifact and
+    # skips cleanly when it is absent, so a mismatched name reads as "the build
+    # produced nothing" and Windows quietly stops publishing.
+    upload_name = _step("Upload desktop artifact")["with"]["name"]
+    for caller in PUBLISHING_CALLERS:
+        jobs = _workflow(caller)["jobs"]
+        publish_jobs = [
+            job
+            for job in jobs.values()
+            if str(job.get("uses", "")).endswith("publish-windows.yml")
+        ]
+        assert publish_jobs, f"{caller} does not call publish-windows.yml"
+        for job in publish_jobs:
+            assert job["with"]["installer_artifact"] == upload_name, (
+                f"{caller} consumes {job['with']['installer_artifact']!r} but "
+                f"build-windows.yml uploads {upload_name!r}"
+            )
+
+
 def test_all_five_signing_env_vars_carry_the_deployed_values() -> None:
     # The hook needs ALL five; the values must match the deployed
     # infrastructure or every signing job fails with AccessDeniedException.

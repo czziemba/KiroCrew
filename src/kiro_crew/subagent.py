@@ -59,6 +59,7 @@ from kiro_crew.llm_helpers import (
     acp_error_is_transient,
     transient_retry_delay,
 )
+from kiro_crew.metrics.events import CHILD_PERMISSION_DENIED, emit_counter
 from kiro_crew.providers.base import (
     EVENT_COMPLETE,
     EVENT_PERMISSION_REQUEST,
@@ -1372,6 +1373,14 @@ class SubagentManager:
         metadata: dict | None = None,
     ) -> None:
         await client.reject_tool(request_id)
+        if event.sub_session_id:
+            # Hang-resilience series: backend-child denials on the headless
+            # subagent surface (low-fidelity fail-close, escalation/turn-limit
+            # bails, interactive rejections). ``reason`` is a closed enum.
+            emit_counter(
+                CHILD_PERMISSION_DENIED,
+                {"surface": "subagent", "reason": error or "rejected"},
+            )
         sel().log_tool_invocation(
             session_key=session_key,
             source="subagent",

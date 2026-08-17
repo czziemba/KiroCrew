@@ -121,6 +121,7 @@ from kiro_crew.messaging.link import (
     legacy_key,
     telemetry_channel_of,
 )
+from kiro_crew.metrics.events import SESSION_IDLE_EXPIRED, emit_counter
 from kiro_crew.metrics.provider import get_recorder
 from kiro_crew.providers.base import CancelOutcome, LLMProvider
 from kiro_crew.sandbox import cleanup_stale_sandbox_profiles
@@ -5169,6 +5170,19 @@ class SessionManager:
             else:
                 logger.warning("Expiring idle session: %s", key)
             Stats().inc_session_cleaned()
+            # Hang-resilience series: an expiry with turn_active=True means
+            # the sweep is killing a runtime MID-TURN — the teardown
+            # signature of the silent-hang incidents (issue #3785).
+            try:
+                _prov = self._sessions.get(key)
+                _prov = getattr(_prov, "provider", None)
+                _turn_active = bool(getattr(_prov, "is_turn_active", False))
+            except Exception:
+                _turn_active = False
+            emit_counter(
+                SESSION_IDLE_EXPIRED,
+                {"turn_active": _turn_active, "orphaned": bool(is_orphan)},
+            )
             # Notify consolidator before reset so it can extract skills.
             if self.on_session_expire:
                 try:

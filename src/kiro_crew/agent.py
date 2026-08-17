@@ -52,6 +52,7 @@ from kiro_crew.agent_files import RESEARCH_AGENT_FILENAME as _RESEARCH_AGENT_FIL
 from kiro_crew.config import config_dir
 from kiro_crew.config import config_path as _mc_config_path
 from kiro_crew.config.paths import (
+    _in_ephemeral_tree,
     _in_linked_git_worktree,
     _valid_override_home,
     isolated_agents_dir,
@@ -285,17 +286,63 @@ _KIROCREW_BIN: str | None = None
 
 
 def _bin_is_usable(path: Path) -> bool:
-    """Return True if *path* is a readable file.
+    """Return True if *path* is a readable launcher whose interpreter still exists.
 
-    Symbol preserved for callers; the previous Amazon-specific Apollo/Brazil
-    wrapper-script rejection logic is a no-op on a public install (those
-    binaries are absent), so any readable executable is accepted.
+    Readability alone is not usability. A launcher is a thin wrapper around an
+    interpreter living elsewhere, so it OUTLIVES the thing it needs: a reaped work
+    directory, a removed ``.venv``, or a pruned bundle leaves an executable file
+    that fails at run time with "virtual environment not found". Accepting one
+    makes ``ensure_kirocrew_on_path`` publish a machine-wide ``kirocrew`` that is
+    broken from the moment it is written — and that function runs on EVERY gateway
+    start, so it would keep re-publishing it.
+
+    Two launcher shapes, judged differently because only one of them states the
+    answer: a pip console script names its interpreter in the shebang, which stays
+    correct for every install layout (a venv, ``python3.12 -m pip install`` into
+    ``~/.local/bin``, a distro package), so it is read directly. A shell wrapper's
+    shebang names the SHELL, so its interpreter is resolved relative to the
+    wrapper instead.
+
+    Nothing is executed, and a launcher naming no interpreter of ours is accepted,
+    so this only ever narrows the set by provably-dead targets.
     """
     try:
-        with open(path, "rb"):
-            return True
+        with open(path, "rb") as stream:
+            head = stream.read(4096)
     except OSError:
         return False
+    if not head.startswith(b"#!"):
+        return True  # compiled launcher (pip's Windows .exe, a frozen binary)
+    text = head.decode("utf-8", errors="replace")
+
+    shebang = text.splitlines()[0][2:].strip()
+    interpreter = shebang.split()[0] if shebang else ""
+    # `#!/usr/bin/env python3` names the FINDER, not the interpreter, so it says
+    # nothing about a specific path; only an absolute python path is decisive.
+    # `is_absolute()` rather than a leading "/" so a native Windows path
+    # (`C:\...\python.exe`) is recognised there too -- pip ships a compiled
+    # `.exe` launcher on Windows, which returns above, but a shebang script that
+    # does reach here must not be judged by a POSIX-only shape.
+    candidate = Path(interpreter)
+    if candidate.is_absolute() and candidate.name.startswith("python"):
+        return candidate.exists()
+
+    bin_dir = path.parent
+    # `<venv>/bin/kirocrew` (already inside the venv) vs `<root>/bin/kirocrew`
+    # (the repo launcher and the packaged bundle's wrapper, beside the venv).
+    venv_root = bin_dir.parent
+    if venv_root.name != ".venv":
+        venv_root = venv_root / ".venv"
+    for marker, candidates in (
+        (".venv", (venv_root / "bin" / "python", venv_root / "Scripts" / "python.exe")),
+        # Packaged PBS bundle: `<root>/bin/python3.12`, beside the launcher.
+        ("python3.12", (bin_dir / "python3.12", venv_root / "bin" / "python3.12")),
+    ):
+        if marker not in text:
+            continue
+        if not any(candidate.exists() for candidate in candidates):
+            return False
+    return True
 
 
 def _kirocrew_bin_subpath(root: Path) -> Path:
@@ -717,6 +764,22 @@ def ensure_kirocrew_on_path(bin_dir: Path | None = None) -> str | None:
             "which is ephemeral (removing the worktree would break `kirocrew` "
             "machine-wide). Install from your primary clone, or link it yourself: "
             "ln -sfn <clone>/.venv/bin/kirocrew ~/.local/bin/kirocrew",
+            target,
+        )
+        return None
+
+    # Same hazard from the other direction: an AppImage's runtime mount and a
+    # scratch tree under the temp dir are both reaped out from under a launcher
+    # that points into them — and this function runs on EVERY gateway start, so
+    # it would re-create that dangling link every time. Declining leaves
+    # whatever already worked in place; a package install (fixed path under
+    # /opt) or a venv install is the shape that can carry a durable launcher.
+    if _in_ephemeral_tree(Path(target).resolve()):
+        logger.info(
+            "Not installing a kirocrew launcher: %s is inside an ephemeral tree (an "
+            "AppImage runtime mount, or the system temp directory), which is reaped "
+            "out from under the link. Install the deb/rpm package for a durable "
+            "`kirocrew` on PATH, or link a persistent install yourself.",
             target,
         )
         return None

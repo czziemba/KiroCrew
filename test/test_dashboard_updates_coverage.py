@@ -1210,12 +1210,16 @@ class TestUpdateInfoAccessors:
             "https://cdn.example.invalid",
         )
 
-    def test_the_recommended_command_pins_https_and_names_the_channel(self):
+    def test_the_recommended_command_pins_https_and_names_the_channel(self, monkeypatch):
+        # Asserts the invariants, not an exact string: the builder is shared with
+        # the gateway's unattended path, so its shape may change (it stopped
+        # piping curl into sh, which hid download failures) while these must hold.
+        monkeypatch.setenv("KIROCREW_CDN_BASE", "https://download.example.invalid")
         command = updates._wheel_update_command("insider", "https://download.example.invalid")
-        assert command == (
-            "curl -fsSL --proto '=https' https://download.example.invalid/cli.sh"
-            " | sh -s -- --channel insider"
-        )
+        assert "--proto '=https'" in command, "must refuse a plaintext override"
+        assert "https://download.example.invalid/cli.sh" in command
+        assert "--channel insider" in command, "a bare re-run would default to stable"
+        assert "| sh" not in command, "piping would hide the download's exit status"
 
 
 class TestExternallyManagedCheck:

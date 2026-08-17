@@ -8,6 +8,7 @@ duplicating layout heuristics.
 from __future__ import annotations
 
 import os
+import re
 from typing import NamedTuple
 
 from kiro_crew.beacon import distribution
@@ -141,15 +142,52 @@ def cdn_bases() -> tuple[str, str]:
     return "https://updates.crew.kiro.dev", "https://download.crew.kiro.dev"
 
 
+#: Characters a CDN base may contain. ``KIROCREW_CDN_BASE`` is operator-set and
+#: the resulting base is interpolated into an installer command that is handed to
+#: a shell, so anything outside this set (a quote, ``;``, ``$(``, whitespace)
+#: could close the URL and append a second command. Also pins the scheme: an
+#: ``http://`` override would make the piped installer interceptable on-path.
+_SAFE_CDN_BASE_RE = re.compile(r"^https://[A-Za-z0-9._/:%@~+\-]+$")
+
+
+def cdn_bases_are_safe() -> bool:
+    """Are both CDN bases free of shell metacharacters and HTTPS-pinned?
+
+    Every caller that builds a shell command from :func:`cdn_bases` must gate on
+    this. It lives here, beside ``cdn_bases``, so the CLI path and the gateway's
+    unattended path cannot drift apart on what they consider safe.
+    """
+    feed_base, artifact_base = cdn_bases()
+    return bool(
+        _SAFE_CDN_BASE_RE.match(feed_base) and _SAFE_CDN_BASE_RE.match(artifact_base)
+    )
+
+
 def wheel_update_command(channel: str | None = None) -> str:
     """The shell command that upgrades a wheel/cli.sh install.
 
     Composed locally from validated inputs — never from feed data.
+
+    Download and execute are SEQUENTIAL, not piped. ``curl … | sh`` reports the
+    exit status of ``sh``, and a shell handed empty input exits 0, so a CDN
+    failure would look like a successful update: the version would not change,
+    the gateway would restart, the check would still see an update available, and
+    the unattended path would loop. Fetching to a temp file first makes the
+    download failure the command's failure, and does it portably (``pipefail``
+    is not POSIX and the resolved ``sh`` is not guaranteed to be bash).
     """
     if channel is None:
         channel = release_channel()
     _, artifact_base = cdn_bases()
-    return f"curl -fsSL --proto '=https' {artifact_base}/cli.sh " f"| sh -s -- --channel {channel}"
+    # ``set -e`` so the fetch failing aborts before sh runs; the temp file is
+    # removed on every exit path including the failure ones.
+    return (
+        "set -e; "
+        '_kc_installer="$(mktemp)"; '
+        "trap 'rm -f \"$_kc_installer\"' EXIT INT TERM; "
+        f"curl -fsSL --proto '=https' {artifact_base}/cli.sh -o \"$_kc_installer\"; "
+        f'sh "$_kc_installer" -s -- --channel {channel}'
+    )
 
 
 __all__ = [
@@ -158,6 +196,7 @@ __all__ = [
     "release_channel",
     "set_release_channel",
     "cdn_bases",
+    "cdn_bases_are_safe",
     "wheel_update_command",
     "RELEASE_CHANNELS",
     "EXTERNALLY_MANAGED",

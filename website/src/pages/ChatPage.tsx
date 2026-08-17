@@ -90,6 +90,7 @@ import {
 import ModelEffortDropdown from '../components/ModelEffortDropdown'
 
 import ChatInput from '../components/ChatInput'
+import ErrorNotice from '../components/ErrorNotice'
 import SessionGridView from '../components/SessionGridView'
 import { anchorForSlot, loadLayout, sessionSlots } from '../hooks/splitLayoutStore'
 import { modelSupportsEffort } from '../lib/effort'
@@ -4831,9 +4832,19 @@ export default function ChatPage({ mode, embedded, embedMode, popout, noUrlSync 
   const continuable = useAppSelector(selectContinuable)
   const interrupted = useAppSelector(selectTurnInterrupted)
   const [continuing, setContinuing] = useState(false)
-  useEffect(() => { setContinuing(false) }, [activeSlot])
+  // Why the refusal is rendered rather than logged: the server re-checks under
+  // the slot lock and can refuse a press the client believed was available
+  // (`slot_running`, `slot_subagents_running`, an approval still pending). Left
+  // in the console, that refusal reached the user as the button flicking to
+  // disabled and straight back — a control that promises recovery and then says
+  // nothing at all. The server already names the reason in `code`; this shows it.
+  const [continueError, setContinueError] = useState('')
+  useEffect(() => { setContinuing(false); setContinueError('') }, [activeSlot])
   // The turn taking over is the success signal; clear the spinner then.
   useEffect(() => { if (continuing && slotRunning) setContinuing(false) }, [continuing, slotRunning])
+  // A turn that actually starts retires the refusal: whatever the slot was busy
+  // with is over, so the old reason would now be describing a state that passed.
+  useEffect(() => { if (slotRunning) setContinueError('') }, [slotRunning])
   // Backstop: a request that neither starts a turn nor rejects must not strand
   // the button in a disabled state. Mirrors the regenerate safety timeout.
   useEffect(() => {
@@ -4844,12 +4855,12 @@ export default function ChatPage({ mode, embedded, embedMode, popout, noUrlSync 
   const handleContinue = useCallback(() => {
     if (!activeSlot || continuing || !continuable) return
     setContinuing(true)
+    setContinueError('')
     // No optimistic transcript mutation: the backend appends the continuation as
     // an `inject` row and the WS `slots` update flips `running`, so the UI
     // converges from the server. Nothing to roll back on failure.
     api.continueSlot(activeSlot).catch((e: unknown) => {
-      // eslint-disable-next-line no-console -- surface continue failures for debugging
-      console.warn('continue failed', e)
+      setContinueError(e instanceof Error && e.message ? e.message : String(e))
       setContinuing(false)
     })
   }, [activeSlot, continuing, continuable])
@@ -6618,6 +6629,25 @@ export default function ChatPage({ mode, embedded, embedMode, popout, noUrlSync 
               <QueueStack messages={queuedMessages} onCancel={handleCancelQueued} onInterrupt={handleInterruptQueued} onEdit={handleEditQueued} onReorder={handleReorderQueued} fuseBelow={followUpOptions.length === 0 && !knowledgeFetch.pendingKnowledge} />
               {flyingQuote && <FlyingQuote text={flyingQuote.text} from={flyingQuote.from} targetRef={inputAreaRef} onComplete={() => setFlyingQuote(null)} />}
               <div ref={inputAreaRef} className="relative z-10">
+              {/* One surface for both Continue buttons — the error card hosts one
+                  and the composer the other, and both call `handleContinue`. Sitting
+                  directly above the composer it is adjacent to the card too, so
+                  neither press can fail silently. Shares the composer's own container
+                  recipe (`px-5` + the theme content width) rather than capping itself:
+                  a narrower centred box reads as belonging to neither the card above
+                  nor the input below. */}
+              {continueError && (
+                <div
+                  className="px-5 mb-1.5 mx-auto w-full"
+                  style={{ maxWidth: 'var(--mc-content-width, 900px)' }}
+                  data-testid="continue-error"
+                >
+                  <ErrorNotice
+                    message={continueError}
+                    onDismiss={() => setContinueError('')}
+                  />
+                </div>
+              )}
               {showHistorySuggestions && (
                 <div className="absolute left-0 right-0 bottom-full mb-1 mx-auto w-full max-w-[760px] border border-border rounded-lg bg-card overflow-hidden animate-scale-in z-50 shadow-lg flex flex-col max-h-[min(300px,40vh)]">
                   <div className="px-3.5 py-2.5 border-b border-border shrink-0">

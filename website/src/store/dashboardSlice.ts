@@ -84,6 +84,19 @@ export const changeApprovalMode = createAsyncThunk(
   },
 )
 
+/** Drop one slot's live sub-agent state.
+ *
+ *  These three maps are keyed by the bare slot key and are otherwise cleared
+ *  only wholesale on reconnect, so a departed slot's counters and rows would
+ *  otherwise survive for the tab's lifetime. Both the optimistic removal and
+ *  the authoritative slot-list reconcile call this, so neither can forget one
+ *  of the three. */
+const evictSlotSubagents = (state: DashboardState, slotKey: string): void => {
+  delete state.subagentRunning[slotKey]
+  delete state.subagentDetails[slotKey]
+  delete state.subagentText[slotKey]
+}
+
 const dashboardSlice = createSlice({
   name: 'dashboard',
   initialState,
@@ -148,6 +161,7 @@ const dashboardSlice = createSlice({
       state.slots = state.slots.filter(s => s.key !== action.payload)
       state.unreadSlots = state.unreadSlots.filter(k => k !== action.payload)
       safeSet('mc-unread-slots', JSON.stringify(state.unreadSlots))
+      evictSlotSubagents(state, action.payload)
     },
     updateSlot(state, action: PayloadAction<Partial<ChatSlot> & { key: string }>) {
       const slot = state.slots.find(s => s.key === action.payload.key)
@@ -303,6 +317,9 @@ const dashboardSlice = createSlice({
         const liveKeys = new Set(action.payload.map((s: { key: string }) => s.key))
         state.unreadSlots = state.unreadSlots.filter(k => liveKeys.has(k))
         safeSet('mc-unread-slots', JSON.stringify(state.unreadSlots))
+        for (const key of Object.keys(state.subagentRunning)) {
+          if (!liveKeys.has(key)) evictSlotSubagents(state, key)
+        }
       })
       .addCase(changeApprovalMode.fulfilled, (state, action) => { state.approvalMode = action.payload })
   },

@@ -266,6 +266,39 @@ const evictMcpApps = (state: { mcpApps: Record<string, McpAppRenderPayload> }, s
   }
 }
 
+/** Chat state keyed by the bare slot key.
+ *
+ *  This list is the single owner of what is keyed per slot: every teardown path
+ *  reads it, so a new per-slot map registered here is reached by all of them.
+ *  `subagents` (keyed `dashboard:<slot>`) and `workflowRuns` (keyed by run id)
+ *  are absent because a bare slot key never matches their entries, and `mcpApps`
+ *  needs a prefix scan, which `evictMcpApps` owns. */
+const slotKeyedMaps = (state: ChatState) => [
+  state.slotMessages, state.slotActivity, state.slotRun, state.slotHydrated,
+  state.slotSide, state.slotSideClosed, state.slotStatusDetail,
+  state.slotContextPct, state.slotContextTokens, state.stopPressedAt,
+  state.followups, state.folderSuggestions,
+].filter(Boolean)
+
+/** Chat state whose writers route the slot through `safeKey()`, which rewrites
+ *  prototype-polluting slot names. Eviction has to apply the same rewrite, or a
+ *  rewritten entry outlives the slot it belongs to. */
+const safeSlotKeyedMaps = (state: ChatState) => [
+  state.pendingQuestions, state.subagentQueued, state.goalLoops,
+].filter(Boolean)
+
+/** Drop every trace of one slot from chat state.
+ *
+ *  A local delete and a reconcile against the authoritative slot list both end
+ *  here, so the two cannot disagree about which maps a departing slot leaves
+ *  entries in. */
+const evictSlotState = (state: ChatState, slotKey: string): void => {
+  for (const m of slotKeyedMaps(state)) delete m[slotKey]
+  for (const m of safeSlotKeyedMaps(state)) delete m[safeKey(slotKey)]
+  evictMcpApps(state, slotKey)
+  state.slotHistory = (state.slotHistory ?? []).filter(k => k !== slotKey)
+}
+
 /** Read one slot's pending question card, or null.
  *
  *  A bare `map[slot]` lookup is not safe even with guarded writes: for
@@ -3237,33 +3270,26 @@ const chatSlice = createSlice({
       /** Reconcile per-slot caches against the authoritative slots list.
        *  Sessions that close/archive/delete vanish from the SSE `slots` REPLACE;
        *  without this reconcile their transcripts stay resident for the tab's
-       *  lifetime (only `deleteSlot.fulfilled` evicts) — the dominant retention
-       *  class behind multi-GB heaps on long-lived dashboard tabs.
+       *  lifetime — the dominant retention class behind multi-GB heaps on
+       *  long-lived dashboard tabs.
        *  Guards: an empty payload is a no-op (SSE reconnect can deliver an
        *  empty frame before the first real snapshot), and the active slot is
        *  never pruned (its live `messages`/optimistic state must not be
-       *  dropped out from under the open pane). `subagents`/`workflowRuns`
-       *  are intentionally excluded — different keyspaces (dashboard:<slot>,
-       *  run id), not bare slot keys. */
+       *  dropped out from under the open pane). */
       .addCase(sseSlots, (state, action) => {
         if (action.payload.length === 0) return
         const live = new Set(action.payload.map(s => s.key))
         if (state.activeSlot) live.add(state.activeSlot)
-        const maps = [
-          state.slotMessages, state.slotActivity, state.slotRun, state.slotHydrated,
-          state.slotSide, state.slotSideClosed, state.slotStatusDetail,
-          state.slotContextPct, state.slotContextTokens, state.stopPressedAt,
-          // Follow-up cards are per slot and can hold multi-KB prompts, so a
-          // deleted session's card must not outlive it.
-          state.followups,
-          state.folderSuggestions,
-        ].filter(Boolean)
-        const cached = new Set(maps.flatMap(m => Object.keys(m)))
+        // Slot history is scanned alongside the maps because a slot can survive
+        // there after every map entry has already been pruned.
+        const cached = new Set([
+          ...slotKeyedMaps(state).flatMap(m => Object.keys(m)),
+          ...(state.slotHistory ?? []),
+        ])
         for (const key of cached) {
           if (live.has(key)) continue
-          for (const m of maps) delete m[key]
+          evictSlotState(state, key)
         }
-        state.slotHistory = (state.slotHistory ?? []).filter(k => live.has(k))
       })
       .addCase(fetchHistory.fulfilled, (state, action) => {
         const { sessions, hasMore, offset, append } = action.payload
@@ -3548,16 +3574,7 @@ const chatSlice = createSlice({
         setPagingCursor(state, false, 0)
       })
       .addCase(deleteSlot.fulfilled, (state, action) => {
-        delete state.slotActivity[action.payload]
-        delete state.slotMessages[action.payload]
-        delete state.slotRun[action.payload]
-        delete state.slotHydrated[action.payload]
-        delete state.slotSide[action.payload]
-        delete state.slotSideClosed[action.payload]
-        if (state.followups) delete state.followups[action.payload]
-        if (state.folderSuggestions) delete state.folderSuggestions[action.payload]
-        evictMcpApps(state, action.payload)
-        state.slotHistory = state.slotHistory.filter(k => k !== action.payload)
+        evictSlotState(state, action.payload)
         if (state.activeSlot === action.payload) {
           state.activeSlot = null
           state.messages = []

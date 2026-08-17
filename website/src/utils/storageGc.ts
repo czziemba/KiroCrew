@@ -26,7 +26,13 @@ const SESSION_PREFIXES = [
   'mc-webpreview-url:',
   'mc-webpreview-pending:',
   'mc-webpreview-applied:',
+  'mc-busy-send-mode:',
 ] as const
+
+/** Session ids that belong to no slot and must survive the orphan sweep.
+ *  Slot-less consumers of a per-slot preference park it under this reserved id,
+ *  so it is live for as long as the origin is. */
+const RESERVED_SESSION_IDS: ReadonlySet<string> = new Set(['no-slot'])
 
 /**
  * Remove localStorage keys belonging to sessions not in `liveSessionIds`.
@@ -46,7 +52,7 @@ export function gcOrphanedStorage(liveSessionIds: Set<string>): number {
       if (key.startsWith(prefix)) {
         // Extract the session ID: everything after the prefix, before any further ':'
         const sessionId = key.slice(prefix.length).split(':')[0]
-        if (sessionId && !liveSessionIds.has(sessionId)) {
+        if (sessionId && !RESERVED_SESSION_IDS.has(sessionId) && !liveSessionIds.has(sessionId)) {
           doomed.push(key)
         }
         break

@@ -44,7 +44,6 @@ import reducer, {
   selectSlotPendingSpawnApprovals,
   selectSlotPendingApproval,
   selectComposerBusy,
-  sweepStaleOptimistic,
 } from '../store/chatSlice'
 import './mockApiClient'
 
@@ -1060,29 +1059,20 @@ describe('sseChatMessage — pipelined sends reconcile (#3898)', () => {
     expect(state.messages[0].meta?.mid).toBe('m-hello')
   })
 
-  it('sweepStaleOptimistic marks timed-out bubbles as stale', () => {
+  it('records no wall-clock timestamp on an optimistic bubble', () => {
+    // The bubble carries `optimistic` (the reconcile scan's marker, load-bearing
+    // for #3898) and nothing else. A per-send `optimisticTs` used to ride along
+    // to drive a 30s "may not have been delivered" notice: the send path already
+    // reports a real failure with its own error bubble and restores the
+    // composer, so that notice could only appear once the server had ACCEPTED
+    // the message, asserting as uncertain the one thing least likely to be true.
+    // It also persisted into the durable transcript and was never cleaned up.
     let state = withSlot
-    // Simulate an optimistic message with an old timestamp by using a custom
-    // appendMessage with a backdated optimisticTs (Immer freezes state, so
-    // we dispatch a raw action with the timestamp already set).
-    const oldTs = Date.now() - 35_000
-    state = reducer(state, appendMessage({ role: 'user', content: 'old msg', cls: '', ts: '2026-08-16T10:00:00.000Z', meta: { sendId: 's-old', optimistic: true, optimisticTs: oldTs } }))
+    state = reducer(state, appendMessage({ role: 'user', content: 'pending', cls: '', ts: '2026-08-16T10:00:00.000Z', meta: { sendId: 's-x' } }))
 
-    state = reducer(state, { type: 'chat/sweepStaleOptimistic' })
-
-    expect(state.messages[0].meta?.stale).toBe(true)
-    expect(state.messages[0].meta?.optimistic).toBe(true) // still optimistic, just stale
-  })
-
-  it('sweepStaleOptimistic does not mark fresh optimistic bubbles as stale', () => {
-    let state = withSlot
-    state = reducer(state, appendMessage({ role: 'user', content: 'fresh msg', cls: '', ts: '2026-08-16T10:00:00.000Z', meta: { sendId: 's-fresh' } }))
-    // optimisticTs is Date.now() — fresh
-
-    state = reducer(state, { type: 'chat/sweepStaleOptimistic' })
-
-    expect(state.messages[0].meta?.stale).toBeUndefined()
     expect(state.messages[0].meta?.optimistic).toBe(true)
+    expect(state.messages[0].meta?.optimisticTs).toBeUndefined()
+    expect(state.messages[0].meta?.stale).toBeUndefined()
   })
 })
 

@@ -273,16 +273,48 @@ export default function ChatPane({
         message: { role: 'user', content: text, cls: 'msg msg-u', ts: new Date().toISOString(), ...(meta ? { meta } : {}) },
       }))
     }
+    // A failed send has to say so on the pane it was typed into. This path
+    // reported nothing at all: the composer had already cleared and a rejected
+    // fetch was swallowed by `.catch(() => undefined)`, so an undelivered
+    // message stayed on screen looking sent. `ChatPage` has always appended an
+    // error row and handed the text back; the pane now does the same, addressed
+    // to the slot that OWNS the message rather than the active one — the user
+    // can switch panes while the POST is in flight.
+    const reportFailedSend = () => {
+      dispatch(appendSlotMessage({
+        slot: slotKey,
+        message: { role: 'error', content: i18nT('pages.chatPage.send_failed') as string, cls: '' },
+      }))
+      // MERGE, never clobber, and never DROP: the send is in flight for seconds
+      // and the user can type a fresh message in that window, so neither payload
+      // may overwrite the other. Mirrors `ChatPage`'s recovery — keep what is
+      // there and APPEND the failed text below it, separated by a blank line, so
+      // the error row's "try again" refers to something the composer still holds.
+      // Identical text is not duplicated. Joined rather than interpolated: the
+      // blank line is message structure, not copy.
+      setInput(prev => {
+        const keep = prev.replace(/\s+$/, '')
+        if (!keep.trim()) return text
+        if (keep.trim() === text.trim()) return prev
+        return [keep, text].join('\n\n')
+      })
+      // Attachments are paths, so a set union recovers the failed ones without
+      // double-attaching a file the user re-picked while the send was in flight.
+      setPendingFiles(prev => [...prev, ...files.filter(f => !prev.includes(f))])
+    }
     api.sendChat(llm, slotKey, undefined, undefined, meta)
       .then(async (r) => {
-        if (!cardAtSend && !askAtSend) return
         const body = await r.json().catch(() => ({}))
+        // The server accepted neither `ok` nor `queued`, so nothing was sent.
+        // Reported before the card logic below, which only runs on acceptance.
+        if (!body.ok && !body.queued) { reportFailedSend(); return }
+        if (!cardAtSend && !askAtSend) return
         // `ok` only: a QUEUED acceptance is still cancellable — the queued
         // path retires at its queue_pop instead (removeQueuedMessage).
         if (body.ok && !body.queued && cardAtSend) dispatch(retireStatelessQuestion({ slot: slotKey, expected: cardAtSend }))
         void resolveAskAfterSend(body, askAtSend, dispatch)
       })
-      .catch(() => undefined)
+      .catch(() => reportFailedSend())
   }, [input, pendingFiles, busy, slotKey, dispatch])
 
   const onStop = useCallback(() => { dispatch(requestStop({ slotId: slotKey, force: false })) }, [dispatch, slotKey])

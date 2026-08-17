@@ -166,3 +166,97 @@ describe('ChatPane agent switch — failures reach the shared notice', () => {
     expect(store.getState().chat.agentSwitchNotice).toBeNull()
   })
 })
+
+/* A pane send that fails used to report NOTHING: the composer cleared on the way
+ * out, the optimistic bubble stayed on screen, and the rejected fetch was
+ * swallowed by `.catch(() => undefined)`, so an undelivered message looked sent
+ * forever. The only signal it ever had was a 30s wall-clock "may not have been
+ * delivered" notice bolted onto every optimistic row — which fired on delivered
+ * messages too and offered no action. These pin the real signal that replaced
+ * it: assert the failure where the message was typed, and hand the text back. */
+describe('ChatPane send — a failed send is reported on the pane', () => {
+  const errorsIn = (store: ReturnType<typeof makeStore>, slot: string) =>
+    (store.getState().chat.slotMessages[slot] || []).filter(m => m.role === 'error')
+
+  it('reports a rejected send and hands the text back to the composer', async () => {
+    ;(api.sendChat as ReturnType<typeof vi.fn>).mockRejectedValueOnce(new Error('offline'))
+    const { store } = renderPane('pane-reject')
+    const box = (await screen.findAllByRole('textbox'))[0]
+    fireEvent.change(box, { target: { value: 'this one never left' } })
+    fireEvent.keyDown(box, { key: 'Enter', code: 'Enter' })
+
+    await waitFor(() => expect(errorsIn(store, 'pane-reject')).toHaveLength(1))
+    // Asserted as a non-empty error row rather than by copy: the string comes
+    // from the shared `pages.chatPage.send_failed` catalog entry, and pinning
+    // its wording here would fail on any locale and on the test env's fallback.
+    expect(errorsIn(store, 'pane-reject')[0].content.trim().length).toBeGreaterThan(0)
+    // The payload is recoverable rather than lost, which is the action the
+    // removed notice never offered.
+    await waitFor(() => expect((box as HTMLTextAreaElement).value).toBe('this one never left'))
+  })
+
+  it('reports a body the server accepted as neither ok nor queued', async () => {
+    ;(api.sendChat as ReturnType<typeof vi.fn>).mockResolvedValueOnce({
+      ok: true, json: () => Promise.resolve({ error: 'slot is stopping' }),
+    })
+    const { store } = renderPane('pane-refused')
+    const box = (await screen.findAllByRole('textbox'))[0]
+    fireEvent.change(box, { target: { value: 'refused at the guard' } })
+    fireEvent.keyDown(box, { key: 'Enter', code: 'Enter' })
+
+    await waitFor(() => expect(errorsIn(store, 'pane-refused')).toHaveLength(1))
+    await waitFor(() => expect((box as HTMLTextAreaElement).value).toBe('refused at the guard'))
+  })
+
+  it('reports nothing when the server accepts the send', async () => {
+    ;(api.sendChat as ReturnType<typeof vi.fn>).mockResolvedValueOnce({
+      ok: true, json: () => Promise.resolve({ ok: true }),
+    })
+    const { store } = renderPane('pane-ok')
+    const box = (await screen.findAllByRole('textbox'))[0]
+    fireEvent.change(box, { target: { value: 'this one landed' } })
+    fireEvent.keyDown(box, { key: 'Enter', code: 'Enter' })
+
+    await waitFor(() => expect(api.sendChat).toHaveBeenCalledTimes(1))
+    expect(errorsIn(store, 'pane-ok')).toHaveLength(0)
+    expect((box as HTMLTextAreaElement).value).toBe('')
+  })
+
+  it('appends the failed payload below a message typed while the send was in flight', async () => {
+    let reject: (e: Error) => void = () => {}
+    ;(api.sendChat as ReturnType<typeof vi.fn>).mockReturnValueOnce(
+      new Promise((_res, rej) => { reject = rej }),
+    )
+    renderPane('pane-merge')
+    const box = (await screen.findAllByRole('textbox'))[0]
+    fireEvent.change(box, { target: { value: 'the failing one' } })
+    fireEvent.keyDown(box, { key: 'Enter', code: 'Enter' })
+    // The user starts a fresh message before the POST settles. NEITHER payload
+    // may win: preferring the newer one silently discards the message the error
+    // row is telling the user to try again, and preferring the older one loses
+    // work they just did.
+    fireEvent.change(box, { target: { value: 'newer work' } })
+    reject(new Error('offline'))
+
+    await waitFor(() =>
+      expect((box as HTMLTextAreaElement).value).toBe('newer work\n\nthe failing one'),
+    )
+  })
+
+  it('does not duplicate the failed text when the composer already holds it', async () => {
+    let reject: (e: Error) => void = () => {}
+    ;(api.sendChat as ReturnType<typeof vi.fn>).mockReturnValueOnce(
+      new Promise((_res, rej) => { reject = rej }),
+    )
+    renderPane('pane-dup')
+    const box = (await screen.findAllByRole('textbox'))[0]
+    fireEvent.change(box, { target: { value: 'same text' } })
+    fireEvent.keyDown(box, { key: 'Enter', code: 'Enter' })
+    // Retyping the same message while the first attempt is in flight is the
+    // common recovery reflex; it must not come back doubled.
+    fireEvent.change(box, { target: { value: 'same text' } })
+    reject(new Error('offline'))
+
+    await waitFor(() => expect((box as HTMLTextAreaElement).value).toBe('same text'))
+  })
+})
